@@ -5023,3 +5023,130 @@ def test_live_state_writes_via_chokepoint_land_in_scoped_workspace(
             assert updated.pending_elicitation_count == 3
     finally:
         session_live_state.configure(None)
+
+
+# ── Item-data serialization seam ─────────────────────
+
+
+def _stored_item_data(
+    store: SqlAlchemyConversationStore, conversation_id: str
+) -> list[object]:
+    """Raw, undecoded ``data`` column values for a conversation, in position
+    order — what actually sits in the row before :func:`_to_item` decodes it."""
+    from sqlalchemy import select
+
+    from omnigent.db.db_models import SqlConversationItem
+
+    with store._conv_session() as session:
+        return list(
+            session.execute(
+                select(SqlConversationItem.data)
+                .where(SqlConversationItem.conversation_id == conversation_id)
+                .order_by(SqlConversationItem.position)
+            ).scalars()
+        )
+
+
+def test_item_data_seam_default_stores_plaintext_json(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """The default ``_encode_item_data`` is identity: the column holds plaintext
+    JSON and reads round-trip unchanged (the seam is a no-op out of the box)."""
+    conv = conversation_store.create_conversation()
+    conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_seam",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "plaintext-marker"}]),
+            )
+        ],
+    )
+
+    [stored] = _stored_item_data(conversation_store, conv.id)
+    assert isinstance(stored, str)
+    assert "plaintext-marker" in stored  # not encoded/encrypted
+
+    [item] = conversation_store.list_items(conv.id).data
+    assert item.data.content[0]["text"] == "plaintext-marker"
+
+
+def test_item_data_seam_subclass_encodes_and_decodes(db_uri: str) -> None:
+    """A subclass overriding the seam transforms ``data`` on write and reverses
+    it on read: the row holds opaque bytes, yet reads round-trip.
+
+    base64 is deliberately not valid item JSON, so a read that skipped
+    ``_decode_item_data`` would fail in ``json.loads`` — a clean round-trip
+    proves both hooks are wired onto the write and read paths.
+    """
+    import base64
+
+    class _Base64ItemDataStore(SqlAlchemyConversationStore):
+        def _encode_item_data(self, data_json: str) -> bytes:
+            return base64.b64encode(data_json.encode("utf-8"))
+
+        def _decode_item_data(self, stored: str | bytes) -> str:
+            return base64.b64decode(bytes(stored)).decode("utf-8")
+
+    store = _Base64ItemDataStore(db_uri)
+    conv = store.create_conversation()
+    store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_enc",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "secret-payload"}]),
+            )
+        ],
+    )
+
+    # Stored form is the opaque transform, not the plaintext JSON.
+    [stored] = _stored_item_data(store, conv.id)
+    stored_bytes = stored if isinstance(stored, (bytes, bytearray)) else str(stored).encode("utf-8")
+    assert b"secret-payload" not in stored_bytes
+    assert "secret-payload" in base64.b64decode(bytes(stored_bytes)).decode("utf-8")
+
+    # Reads reverse the transform and recover the entity.
+    [item] = store.list_items(conv.id).data
+    assert item.data.content[0]["text"] == "secret-payload"
+
+
+def test_item_search_text_seam_redirects_persisted_value(db_uri: str) -> None:
+    """The ``_item_search_text`` hook controls what lands in ``search_text``.
+
+    (Returning ``None`` from the hook — to skip the column on a schema that
+    omits it — is exercised by such a backend; the OSS SQLite schema keeps
+    ``search_text`` NOT NULL, so this asserts the string-returning path.)
+    """
+    from sqlalchemy import select
+
+    from omnigent.db.db_models import SqlConversationItem
+
+    class _CustomSearchTextStore(SqlAlchemyConversationStore):
+        def _item_search_text(self, item: NewConversationItem) -> str:
+            return "custom-search-text"
+
+    store = _CustomSearchTextStore(db_uri)
+    conv = store.create_conversation()
+    store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_st",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "body text"}]),
+            )
+        ],
+    )
+
+    with store._conv_session() as session:
+        stored = list(
+            session.execute(
+                select(SqlConversationItem.search_text).where(
+                    SqlConversationItem.conversation_id == conv.id
+                )
+            ).scalars()
+        )
+    assert stored == ["custom-search-text"]

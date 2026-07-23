@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+from typing import Any, Callable
 
 from sqlalchemy import (
     ColumnElement,
@@ -598,7 +598,10 @@ def _fetch_search_snippets(
     return out
 
 
-def _to_item(row: SqlConversationItem) -> ConversationItem:
+def _to_item(
+    row: SqlConversationItem,
+    decode_item_data: Callable[[Any], str] = lambda stored: stored,
+) -> ConversationItem:
     """
     Convert a :class:`SqlConversationItem` ORM row to a
     :class:`ConversationItem` entity.
@@ -607,6 +610,11 @@ def _to_item(row: SqlConversationItem) -> ConversationItem:
     the appropriate typed data model.
 
     :param row: The SQLAlchemy ORM row to convert.
+    :param decode_item_data: Inverse of the store's item-data write transform
+        (see :meth:`SqlAlchemyConversationStore._decode_item_data`), applied to
+        ``row.data`` before it is JSON-parsed. Defaults to identity, matching
+        the plaintext ``data`` column; a subclass that encodes the column on
+        write (compression, encryption) passes its decoder here.
     :returns: A :class:`ConversationItem` Pydantic model.
     """
     item_type = decode_item_type(row.type)
@@ -616,7 +624,7 @@ def _to_item(row: SqlConversationItem) -> ConversationItem:
         status=decode_item_status(row.status),
         response_id=row.response_id,
         created_at=row.created_at,
-        data=parse_item_data(item_type, json.loads(row.data)),
+        data=parse_item_data(item_type, json.loads(decode_item_data(row.data))),
         created_by=row.created_by,
     )
 
@@ -1708,7 +1716,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             # Preserve FTS rank order
             order = {iid: i for i, iid in enumerate(item_ids)}
-            return [_to_item(r) for r in sorted(rows, key=lambda r: order[r.id])]
+            return [_to_item(r, self._decode_item_data) for r in sorted(rows, key=lambda r: order[r.id])]
 
     def list_items(
         self,
@@ -1782,7 +1790,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             has_more = len(rows) > limit
             if has_more:
                 rows = rows[:limit]
-            items = [_to_item(r) for r in rows]
+            items = [_to_item(r, self._decode_item_data) for r in rows]
             return PagedList(
                 data=items,
                 first_id=items[0].id if items else None,
@@ -1824,8 +1832,41 @@ class SqlAlchemyConversationStore(ConversationStore):
                 .order_by(ranked.c.conversation_id, ranked.c.position.desc())
             ).all()
             for row in rows:
-                result[row.conversation_id].append(_to_item(row))  # type: ignore[arg-type]
+                result[row.conversation_id].append(_to_item(row, self._decode_item_data))  # type: ignore[arg-type]
         return result
+
+    def _encode_item_data(self, data_json: str) -> str | bytes:
+        """
+        Transform an item's serialized ``data`` JSON on its way into the
+        ``conversation_items.data`` column. Inverse of :meth:`_decode_item_data`.
+
+        The default is identity — the column stores plaintext JSON. A subclass
+        may override to compress or encrypt the payload (returning ``bytes``),
+        provided it applies the matching inverse in :meth:`_decode_item_data`.
+        """
+        return data_json
+
+    def _decode_item_data(self, stored: str | bytes) -> str:
+        """
+        Inverse of :meth:`_encode_item_data`, applied when reading a row.
+
+        The default returns text unchanged, decoding ``bytes`` as UTF-8 for
+        backends that map the column to a binary type. A subclass that encoded
+        the column on write reverses that transform here to recover the JSON.
+        """
+        return stored if isinstance(stored, str) else bytes(stored).decode("utf-8")
+
+    def _item_search_text(self, item: NewConversationItem) -> str | None:
+        """
+        Plain-text extraction of *item* persisted in ``search_text`` and indexed
+        for full-text search by :meth:`append`.
+
+        The default extracts the searchable text as before. A subclass whose
+        schema omits ``search_text`` (e.g. because ``data`` is stored opaquely
+        and cannot be searched in SQL) returns ``None`` to skip persisting the
+        column and its FTS row entirely.
+        """
+        return strip_nul_bytes(extract_search_text(item))
 
     def append(
         self,
@@ -1895,8 +1936,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                 # column, which rejects them outright. Tool output can
                 # embed NUL (e.g. reading a binary file); without this
                 # the whole INSERT aborts and the item never persists.
-                data = strip_nul_bytes(json.dumps(data_dict))
-                search = strip_nul_bytes(extract_search_text(item))
+                data = self._encode_item_data(strip_nul_bytes(json.dumps(data_dict)))
+                search = self._item_search_text(item)
                 item_id = generate_item_id(item.type)
                 row = SqlConversationItem(
                     id=item_id,
@@ -1907,11 +1948,15 @@ class SqlAlchemyConversationStore(ConversationStore):
                     position=position,
                     type=encode_item_type(item.type),
                     data=data,
-                    search_text=search,
                     created_by=item.created_by,
                 )
+                # A backend may omit search_text (see _item_search_text); leaving
+                # the attribute unset drops it from the INSERT so a schema without
+                # the column still works, and skips its FTS row.
+                if search is not None:
+                    row.search_text = search
+                    fts_rows.append((item_id, conversation_id, search))
                 session.add(row)
-                fts_rows.append((item_id, conversation_id, search))
                 persisted.append(
                     ConversationItem(
                         id=row.id,
